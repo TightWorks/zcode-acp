@@ -541,6 +541,139 @@ describe("manual coding-plan keys from provider_config.json (#344)", () => {
   });
 });
 
+/** A fake JWT. `exp` is unix seconds; the signature is not a real credential. */
+function fakeJwt(exp: number): string {
+  const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({ exp })).toString("base64url");
+  return `${header}.${payload}.sig`;
+}
+
+describe("Desktop oauth coding-plan login — no :api-key (#344)", () => {
+  const bigmodelProvider = "account:bigmodel-individual-coding-plan";
+  const profile = JSON.stringify({
+    id: "user-bigmodel",
+    username: "owner",
+    displayName: "Owner",
+  });
+
+  function writeOauth(entries: Record<string, string>): void {
+    writeCredentialStore({
+      "oauth:bigmodel:access_token": fakeJwt(4_000_000_000),
+      "oauth:bigmodel:user_info": profile,
+      "oauth:active_provider": "bigmodel",
+      zcodejwttoken: fakeJwt(4_000_000_000),
+      [`account-provider:${bigmodelProvider}:auth-source`]: "oauth",
+      [`account-provider:${bigmodelProvider}:identity`]: "key-3dc7cb82",
+      ...entries,
+    });
+  }
+
+  it("authenticates and entitles bigmodel individual when the store is oauth-only", () => {
+    writeOauth({});
+    expect(zcodeCredentialsPresent()).toBe(true);
+    expect(authenticate({ methodId: "zcode-credentials" })).toEqual({});
+    const { providers } = buildAccountProviderConfig()!;
+    expect(providers[bigmodelProvider]!.access.entitled).toBe(true);
+    expect(providers["account:zai-individual-coding-plan"]!.access.entitled).toBe(false);
+    expect(providers["account:bigmodel-team-coding-plan"]!.access.entitled).toBe(false);
+    // The sync reader must not invent an api key from the login JWT.
+    expect(codingPlanRequestAuthFor(bigmodelProvider)).toBeNull();
+  });
+
+  it("entitles zai from a raw user_info profile and no api-key", () => {
+    writeCredentialStore({
+      "oauth:zai:access_token": fakeJwt(4_000_000_000),
+      "oauth:zai:user_info": JSON.stringify({
+        user_id: "zai-user",
+        name: "Zai User",
+        email: "z@example.com",
+      }),
+      "account-provider:account:zai-individual-coding-plan:auth-source": "oauth",
+    });
+    expect(zcodeCredentialsPresent()).toBe(true);
+    const { providers } = buildAccountProviderConfig()!;
+    expect(providers["account:zai-individual-coding-plan"]!.access.entitled).toBe(true);
+    expect(providers[bigmodelProvider]!.access.entitled).toBe(false);
+    expect(codingPlanRequestAuthFor("account:zai-individual-coding-plan")).toBeNull();
+  });
+
+  it("accepts a legacy oauth session that has no auth-source marker and no api-key", () => {
+    writeCredentialStore({
+      "oauth:bigmodel:access_token": fakeJwt(4_000_000_000),
+      "oauth:bigmodel:user_info": profile,
+    });
+    expect(zcodeCredentialsPresent()).toBe(true);
+    expect(buildAccountProviderConfig()!.providers[bigmodelProvider]!.access.entitled).toBe(true);
+  });
+
+  it("fails closed when the oauth JWT is expired, even if a leftover api-key is stored", () => {
+    writeOauth({
+      "oauth:bigmodel:access_token": fakeJwt(1_000_000_000),
+      "account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:108:api-key":
+        "leftover-key",
+    });
+    expect(zcodeCredentialsPresent()).toBe(false);
+    expect(() => authenticate({ methodId: "zcode-credentials" })).toThrowError(
+      messages().authErrNoCredentials,
+    );
+    expect(buildAccountProviderConfig()!.providers[bigmodelProvider]!.access.entitled).toBe(false);
+    expect(codingPlanRequestAuthFor(bigmodelProvider)).toBeNull();
+  });
+
+  it("fails closed when auth-source is oauth but the access token is missing", () => {
+    writeCredentialStore({
+      "oauth:bigmodel:user_info": profile,
+      [`account-provider:${bigmodelProvider}:auth-source`]: "oauth",
+      [`account-provider:${bigmodelProvider}:identity`]: "key-3dc7cb82",
+    });
+    expect(zcodeCredentialsPresent()).toBe(false);
+    expect(codingPlanRequestAuthFor(bigmodelProvider)).toBeNull();
+  });
+
+  it("does not treat oauth as present without an account identity", () => {
+    writeCredentialStore({
+      "oauth:bigmodel:access_token": fakeJwt(4_000_000_000),
+      [`account-provider:${bigmodelProvider}:auth-source`]: "oauth",
+    });
+    expect(zcodeCredentialsPresent()).toBe(false);
+  });
+
+  it("keeps a #320 api-key authoritative when the store has no oauth source marker", () => {
+    writeCredentialStore({
+      "oauth:bigmodel:access_token": fakeJwt(4_000_000_000),
+      "oauth:bigmodel:user_info": profile,
+      "account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:108:api-key":
+        "stored-individual-key",
+    });
+    expect(codingPlanRequestAuthFor(bigmodelProvider)).toEqual({
+      apiKey: "stored-individual-key",
+    });
+  });
+
+  it("serves an explicit manual api-key and does not switch that plan onto oauth", () => {
+    writeOauth({
+      [`account-provider:${bigmodelProvider}:auth-source`]: "manual",
+      "account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:108:api-key":
+        "manual-stored-key",
+    });
+    expect(codingPlanRequestAuthFor(bigmodelProvider)).toEqual({ apiKey: "manual-stored-key" });
+  });
+
+  it("does not let oauth override an unavailable desktop verdict", () => {
+    writeOauth({});
+    writeFileSync(
+      path.join(root, ".zcode", "v2", "coding-plan-cache.json"),
+      JSON.stringify({
+        entryStatus: {
+          items: { "builtin:bigmodel-coding-plan": { status: "unavailable" } },
+        },
+      }),
+    );
+    expect(buildAccountProviderConfig()!.providers[bigmodelProvider]!.access.entitled).toBe(false);
+    expect(zcodeCredentialsPresent()).toBe(false);
+  });
+});
+
 describe("authenticate (#344)", () => {
   it("answers {} when any credential source exists", () => {
     writePersonalRules([

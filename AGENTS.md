@@ -296,8 +296,14 @@ required for`); any other error aborts. Display side, `buildConfigOptions`
     bridge answers `headersApplied:true, requestAuth:{apiKey}` with the plan's
     config.json key for individual coding plans
     (`answerProviderRuntimeHeaders`, server-requests.ts) — the same key the
-    pre-3.12 `builtin:` provider used; start-plan stays declined (Aliyun
-    captcha, #123). **The answer is wired at frame ARRIVAL**
+    pre-3.12 `builtin:` provider used. Desktop OAuth logins (3.17, #344) never
+    write that key: `auth-source=oauth` plus the family access token is the
+    credential, and the bridge exchanges it for a Project Access Token the way
+    the desktop host does (`resolveOauthCodingPlanRequestAuth`) — `apiKey` in
+    the reply is that short-lived token, not the login JWT and not a smuggled
+    api-key. Missing or expired oauth fails closed (no leftover `:api-key`
+    fallback). start-plan stays declined (Aliyun captcha, #123). **The answer
+    is wired at frame ARRIVAL**
     (`ZcodeBackend.providerRuntimeHeadersResponder`, set in ensureBackend), not
     just the turn-loop queue: a headers ask that lands while no turn loop is
     polling — compact's internal turn above all — used to sit unanswered until

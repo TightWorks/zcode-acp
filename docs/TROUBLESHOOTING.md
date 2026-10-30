@@ -106,14 +106,20 @@ message errors immediately and retries; the backend log shows
 (`interaction/requestProviderRuntimeHeaders`) before EVERY model request on an
 account provider. A `headersApplied:false` answer makes the turn fail with
 -32031 and retry. The bridge (0.42.5+) answers with the coding plan's API key
-from `~/.zcode/v2/config.json` (`codingPlanRequestAuthFor`) — if sends still
-fail, check that the enabled `builtin:bigmodel-coding-plan` entry carries a
-non-empty `options.apiKey` in that file. On a fresh desktop-only install that
-never wrote `config.json`, both the entitlement snapshot and the request key
-come from the encrypted store `~/.zcode/v2/credentials.json` instead (#320) —
-log into the ZCode desktop app once so it exists. A coding-plan key added in
-the desktop's Settings → Model Provider ("Use API key") counts too (#344): it
-lands in `~/.zcode/v2/provider_config.json` as a
+from `~/.zcode/v2/config.json` (`codingPlanRequestAuthFor`) when that file
+holds one. On a fresh desktop-only install that never wrote `config.json`,
+two store shapes both count:
+
+- a plan api-key in `~/.zcode/v2/credentials.json` (`…:api-key`, #320), or
+- a Desktop OAuth login in the same file (`auth-source=oauth`, family
+  `oauth:<family>:access_token`, identity; **no** `:api-key` — Desktop 3.17,
+  #344). The bridge exchanges that login for a project access token and
+  sends the token as `requestAuth.apiKey`. It does not copy the OAuth JWT
+  into the api-key field. A missing or expired login fails the headers
+  request instead of falling back to a leftover key.
+
+A coding-plan key added in the desktop's Settings → Model Provider ("Use API
+key") counts too (#344): it lands in `~/.zcode/v2/provider_config.json` as a
 `zhipu-coding-plan-api-key` rule and the bridge reads it as an entitlement +
 request-key source. Start-plan providers stay
 declined (Aliyun captcha — desktop app only, issue #123).
@@ -134,7 +140,7 @@ declined (Aliyun captcha — desktop app only, issue #123).
    - There must be a `provider` entry with `"enabled": true`
    - Its `options.apiKey` must be present and non-empty
 
-2. If the file is missing or the key is stale, **install and log into the ZCode desktop app** — it writes a fresh `config.json` with a valid enabled provider. There is no manual API-key configuration in the editor. The `authenticate` sign-in call editors make (Xcode) answers `{}` once ANY credential source is readable (config.json, provider_config.json's manual coding-plan key, a saved `zcode-acp setup` account, or the encrypted store); before that it errors with instructions.
+2. If the file is missing, a Desktop OAuth login is still enough: `authenticate` succeeds when `credentials.json` holds `auth-source=oauth` for an individual coding plan and no plan api-key. The `authenticate` sign-in call editors make (Xcode) answers `{}` once ANY credential source is readable (that oauth session, config.json, provider_config.json's manual coding-plan key, a saved `zcode-acp setup` account, or a store `:api-key`); before that it errors with instructions. An expired oauth JWT does not count.
 
 3. There is no env override for the provider base URL: the app-server reads `ZCODE_BASE_URL` as its own service origin, so the bridge never passes one through (see `src/backend/credentials.ts`). Edit `config.json` (or the provider config in the App) instead.
 

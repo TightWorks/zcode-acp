@@ -34,6 +34,12 @@ import type { ZcodeBackend } from "../backend/client.js";
 import { BUILTIN_PROVIDER_ENV, builtinProviderEnv } from "../backend/resolve.js";
 import { log, warn, zcodePersonalProviderPath, ZCODE_CREDS_PATH } from "../utils.js";
 import { bridgeOverlays, readCredentialConfig } from "./bridge-accounts.js";
+import {
+  type CodingPlanFamily,
+  codingPlanFamilyOf,
+  oauthEntitlementCandidate,
+  readOauthCodingPlan,
+} from "./oauth-coding-plan.js";
 
 /** The bundled provider-table file the CLI boots from. */
 const PROVIDER_CONFIG_NAME = "zcode-builtin.json";
@@ -215,12 +221,14 @@ function storeIndividualCodingPlanKey(accountProviderId: string): string | null 
  *      Desktop-only, so a headless-only machine falls through.
  *   2. `config.json` (legacy CLI config) — `builtin:*` entries with
  *      `enabled:true` AND an apiKey. Still written by the app.
- *   3. The encrypted credential store (#320) — a fresh desktop-only install
- *      writes NEITHER of the above; its plan api-keys live only in
- *      `~/.zcode/v2/credentials.json`. Weaker evidence than a verdict (the
- *      store also keeps keys for plans the account does not currently hold),
- *      so it only speaks when no verdict-bearing source said anything at all,
- *      and only for individual plans (see storeIndividualCodingPlanKey).
+ *   3. The encrypted credential store — a fresh desktop-only install writes
+ *      NEITHER of the above. Two shapes live here, and they do not mix:
+ *      a plan api-key (`…:api-key`, #320) OR a Desktop OAuth login
+ *      (`auth-source=oauth` plus the family's access token and identity,
+ *      no api-key — Desktop 3.17, #344). Weaker evidence than a verdict, so
+ *      either shape only speaks when no verdict-bearing source said anything
+ *      at all, and only for individual plans. Explicit oauth never treats a
+ *      leftover api-key as entitlement.
  *   4. `setting.json` — last resort: the Settings UI's remembered pick per
  *      family. A SELECTION record, not an entitlement.
  *
@@ -371,8 +379,9 @@ function desktopEntitledBuiltinProviders(): Set<string> {
     // unreadable config — the other sources decide
   }
   if (out.size > 0) return out;
-  // 3) Fresh desktop-only layout (#320): no verdict-bearing source spoke, but
-  //    the encrypted store holds the account's individual plan key.
+  // 3) Fresh desktop-only layout: no verdict-bearing source spoke. The store
+  //    holds either an individual plan api-key (#320) or a Desktop oauth login
+  //    with no api-key (#344). Explicit oauth does not read the leftover key.
   if (!sawVerdict) {
     const rules =
       readBuiltinTable()?.table.config?.providerConfigRules?.providerRules?.filter(
@@ -380,10 +389,13 @@ function desktopEntitledBuiltinProviders(): Set<string> {
       ) ?? [];
     for (const rule of rules) {
       if (rule.config?.access?.mode !== "individual-coding-plan") continue;
+      // Explicit oauth must not be resurrected by a leftover plan api-key.
+      if (oauthAuthSource(rule.providerId) === "oauth") continue;
       if (storeIndividualCodingPlanKey(rule.providerId)) {
         out.add(configProviderIdFor(rule.providerId));
       }
     }
+    for (const legacyId of oauthEntitledLegacyIds()) out.add(legacyId);
   }
   if (out.size > 0) return out;
   // 4) Last resort only (everything above empty — a machine that has never
@@ -417,9 +429,13 @@ function desktopEntitledBuiltinProviders(): Set<string> {
  * with the plan's API key; the bridge serves the same plan's key from legacy
  * config.json when written, and otherwise from the encrypted credential store
  * — a fresh desktop-only install writes no config.json, its plan key lives
- * only there (#320). Only the individual coding plan is served: start-plan
- * needs an Aliyun captcha (stays refused, issue #123), and team keys are not
- * entitlement evidence (see storeIndividualCodingPlanKey).
+ * only there (#320). Desktop OAuth (auth-source=oauth, no :api-key) is NOT
+ * served here: the sync reader would have to smuggle the login JWT. The
+ * runtime-headers path exchanges that login for a project access token
+ * instead (resolveOauthCodingPlanRequestAuth). Only the individual coding
+ * plan is served: start-plan needs an Aliyun captcha (stays refused, issue
+ * #123), and team keys are not entitlement evidence (see
+ * storeIndividualCodingPlanKey).
  */
 export function codingPlanRequestAuthFor(
   accountProviderId: string | undefined,
@@ -452,15 +468,62 @@ export function codingPlanRequestAuthFor(
   // store (a fresh-install account key) but below the bridge's own setups.
   const manual = manualCodingPlanKeys().get(legacyId);
   if (manual) return { apiKey: manual };
+  // OAuth owns the request even when a stale :api-key is still in the store.
+  // The caller issues a project token; returning the leftover key here would
+  // put a secret Desktop no longer uses on the model request.
+  if (oauthOwnsIndividualCodingPlan(accountProviderId)) return null;
   const stored = storeIndividualCodingPlanKey(accountProviderId);
   return stored ? { apiKey: stored } : null;
+}
+
+function oauthAuthSource(accountProviderId: string): "oauth" | "manual" | "absent" | null {
+  const family = codingPlanFamilyOf(accountProviderId);
+  if (!family) return null;
+  return readOauthCodingPlan(family).authSource;
+}
+
+/**
+ * True when this individual plan's request auth must come from the OAuth
+ * project-token exchange rather than a stored api-key.
+ *
+ * Explicit `auth-source=oauth` always owns, including when the login JWT is
+ * missing or expired (fail closed — no api-key fallback). A record with no
+ * source marker owns only when a usable oauth session is the only secret;
+ * a #320 api-key with no marker keeps the key path.
+ */
+export function oauthOwnsIndividualCodingPlan(accountProviderId: string | undefined): boolean {
+  const family = codingPlanFamilyOf(accountProviderId ?? "");
+  if (!family || !accountProviderId) return false;
+  const session = readOauthCodingPlan(family);
+  if (session.authSource === "manual") return false;
+  if (session.authSource === "oauth") return true;
+  if (storeIndividualCodingPlanKey(accountProviderId)) return false;
+  return oauthEntitlementCandidate(session);
+}
+
+/** Legacy builtin ids entitled by a usable Desktop oauth login (source 3). */
+function oauthEntitledLegacyIds(): string[] {
+  const ids: string[] = [];
+  for (const family of ["bigmodel", "zai"] as const satisfies readonly CodingPlanFamily[]) {
+    const session = readOauthCodingPlan(family);
+    if (session.authSource === "oauth") {
+      if (oauthEntitlementCandidate(session)) ids.push(`builtin:${family}-coding-plan`);
+      continue;
+    }
+    if (session.authSource === "manual") continue;
+    const providerId = `account:${family}-individual-coding-plan`;
+    if (storeIndividualCodingPlanKey(providerId)) continue;
+    if (oauthEntitlementCandidate(session)) ids.push(`builtin:${family}-coding-plan`);
+  }
+  return ids;
 }
 
 /**
  * Whether any usable ZCode credential exists — the `authenticate` method's
  * readiness check (#344). True when a manual coding-plan key sits in
  * provider_config.json, a bridge account is saved, the merged config.json
- * view holds any provider key, or the desktop ladder found an entitlement.
+ * view holds any provider key, or the desktop ladder found an entitlement
+ * (including a usable Desktop OAuth coding-plan login with no api-key).
  * False means the editor user gets the actionable sign-in error instead of a
  * silent success that dies on the first turn.
  */
