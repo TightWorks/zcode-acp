@@ -345,6 +345,17 @@ function entitledBuiltinProviders(): Set<string> {
   return out;
 }
 
+/**
+ * Legacy ids of individual coding plans the dropdown may advertise.
+ * Start-plan and team plans are not included: start-plan stays captcha-only,
+ * and a team key is not entitlement.
+ */
+export function entitledLegacyCodingPlanIds(): string[] {
+  return [...entitledBuiltinProviders()].filter((id) =>
+    /^builtin:(bigmodel|zai)-coding-plan$/.test(id),
+  );
+}
+
 /** Sources 1-4 above, read from the raw desktop files only. */
 function desktopEntitledBuiltinProviders(): Set<string> {
   const out = new Set<string>();

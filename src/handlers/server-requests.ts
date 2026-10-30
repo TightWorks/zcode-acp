@@ -51,6 +51,7 @@ import {
   codingPlanRequestAuthFor,
   oauthOwnsIndividualCodingPlan,
 } from "../config/account-provider.js";
+import { OFFICIAL_MCP_AUTH_METHOD, officialMcpAuthReply } from "../config/official-mcp-auth.js";
 import { resolveOauthCodingPlanRequestAuth } from "../config/oauth-coding-plan.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
 import { interactionTimeoutMs } from "../config/settings.js";
@@ -329,9 +330,11 @@ export async function handleServerRequests(
           sendZcodeReply(
             backend,
             req.id,
-            isProviderRuntimeHeadersRequest(req.method)
-              ? { headersApplied: false, errorMessage: "turn cancelled" }
-              : { action: "decline", reason: "turn cancelled" },
+            isOfficialMcpAuthHeadersRequest(req.method)
+              ? { ok: false, reason: "official_auth_unavailable" }
+              : isProviderRuntimeHeadersRequest(req.method)
+                ? { headersApplied: false, errorMessage: "turn cancelled" }
+                : { action: "decline", reason: "turn cancelled" },
           );
           declined = true;
         } else {
@@ -391,6 +394,10 @@ async function handleOne(
 
   if (isProviderRuntimeHeadersRequest(method)) {
     answerProviderRuntimeHeaders(backend, zcodeReqId, method, params as Record<string, unknown>);
+    return;
+  }
+  if (isOfficialMcpAuthHeadersRequest(method)) {
+    answerOfficialMcpAuthHeaders(backend, zcodeReqId, method, params as Record<string, unknown>);
     return;
   }
 
@@ -536,6 +543,10 @@ async function settleOrphan(
     }
     if (isProviderRuntimeHeadersRequest(req.method)) {
       answerProviderRuntimeHeaders(backend, req.id, req.method, params);
+      return;
+    }
+    if (isOfficialMcpAuthHeadersRequest(req.method)) {
+      answerOfficialMcpAuthHeaders(backend, req.id, req.method, params);
       return;
     }
     if (isPermissionRequest(req.method) && isSessionAlwaysTool(`${params["toolName"] ?? ""}`)) {
@@ -1324,6 +1335,41 @@ function isUserInputRequestUnchecked(method: string): boolean {
 /** @see handleOne — the Start Plan captcha-session request (issue #123). */
 function isProviderRuntimeHeadersRequest(method: string): boolean {
   return method === "interaction/requestProviderRuntimeHeaders";
+}
+
+function isOfficialMcpAuthHeadersRequest(method: string): boolean {
+  return method === OFFICIAL_MCP_AUTH_METHOD;
+}
+
+/**
+ * Answer `interaction/requestOfficialMcpAuthHeaders`. Desktop 3.17 asks this
+ * during model setup; leaving it unhandled or declining it as a permission
+ * (`{action:"decline"}`) fails the turn with CONFIGURATION_ERROR "Model
+ * creation failed". The body is the official-MCP header object, built from
+ * the same oauth credential store the project-token path reads.
+ */
+export function answerOfficialMcpAuthHeaders(
+  backend: ZcodeBackend,
+  reqId: number | string,
+  method: string,
+  params: Record<string, unknown>,
+): boolean {
+  if (!isOfficialMcpAuthHeadersRequest(method)) return false;
+  let reply: ReturnType<typeof officialMcpAuthReply>;
+  try {
+    reply = officialMcpAuthReply(params);
+  } catch (error) {
+    warn(
+      `official mcp auth headers failed closed (${
+        error instanceof Error ? error.message : "official_auth_unavailable"
+      })`,
+    );
+    reply = { ok: false, reason: "official_auth_unavailable" };
+  }
+  if (reply.ok) log("  official mcp auth headers: serving oauth identity headers");
+  else warn(`  ⚠ official mcp auth headers declined (${reply.reason})`);
+  sendZcodeReply(backend, reqId, reply);
+  return true;
 }
 
 /**

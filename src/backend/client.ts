@@ -34,7 +34,11 @@ export class ZcodeBackend extends JsonRpcChild {
    * 2026-09-19). Wired by ZcodeAcpServer.ensureBackend to the coding-plan key
    * answer; returning false falls back to queueing (turn-loop handling).
    */
-  providerRuntimeHeadersResponder?: (id: number, params: Record<string, unknown>) => boolean;
+  providerRuntimeHeadersResponder?: (
+    id: number,
+    params: Record<string, unknown>,
+    method?: string,
+  ) => boolean;
   /**
    * Arrival-time hook for compact terminal states. `session/compact` runs its
    * internal turn in the background and NEVER reports failure on the RPC —
@@ -107,10 +111,12 @@ export class ZcodeBackend extends JsonRpcChild {
       return true;
     }
     if (
-      req.method === "interaction/requestProviderRuntimeHeaders" &&
+      (req.method === "interaction/requestProviderRuntimeHeaders" ||
+        req.method === "interaction/requestOfficialMcpAuthHeaders") &&
       this.providerRuntimeHeadersResponder?.(
         req.id as number,
         req.params as Record<string, unknown>,
+        req.method,
       )
     ) {
       // Answered at arrival — see providerRuntimeHeadersResponder. This is

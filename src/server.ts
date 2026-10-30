@@ -30,6 +30,7 @@ import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend, TURN_STATE_METHODS } from "./handlers/io.js";
 import { SandboxRestartBatcher, flushSandboxGrants } from "./handlers/sandbox-allow.js";
 import {
+  answerOfficialMcpAuthHeaders,
   answerProviderRuntimeHeaders,
   sweepOrphanedServerRequests,
 } from "./handlers/server-requests.js";
@@ -768,9 +769,14 @@ export class ZcodeAcpServer {
     // loop; the backend waits seconds for this handshake, a tick is free.
     // Captures the LOCAL instance: a respawned backend must never receive
     // replies for a frame the dying one asked.
-    backend.providerRuntimeHeadersResponder = (id, params) => {
+    backend.providerRuntimeHeadersResponder = (id, params, method) => {
+      const official = method === "interaction/requestOfficialMcpAuthHeaders";
       setImmediate(() => {
         try {
+          if (official) {
+            answerOfficialMcpAuthHeaders(backend, id, method, params);
+            return;
+          }
           answerProviderRuntimeHeaders(
             backend,
             id,
@@ -783,7 +789,12 @@ export class ZcodeAcpServer {
               `${e instanceof Error ? e.message : String(e)}`,
           );
           try {
-            backend.sendReply(id, { headersApplied: false, errorMessage: "bridge error" });
+            backend.sendReply(
+              id,
+              official
+                ? { ok: false, reason: "official_auth_unavailable" }
+                : { headersApplied: false, errorMessage: "bridge error" },
+            );
           } catch {
             /* backend gone — nothing to answer */
           }

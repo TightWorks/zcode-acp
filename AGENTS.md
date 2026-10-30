@@ -302,7 +302,14 @@ required for`); any other error aborts. Display side, `buildConfigOptions`
     the desktop host does (`resolveOauthCodingPlanRequestAuth`) — `apiKey` in
     the reply is that short-lived token, not the login JWT and not a smuggled
     api-key. Missing or expired oauth fails closed (no leftover `:api-key`
-    fallback). start-plan stays declined (Aliyun captcha, #123). **The answer
+    fallback). Desktop 3.17 also asks `interaction/requestOfficialMcpAuthHeaders`
+    during model setup; that reply is `{ok, headers}` (ZCode JWT on
+    `Authorization`, the family oauth access token on
+    `X-Bigmodel-Authorization`, `Bigmodel-Target-Type: PERSONAL`) — not the
+    runtime-headers `requestAuth` object and not an api-key. An unhandled or
+    `{action:"decline"}` answer fails the turn as CONFIGURATION_ERROR "Model
+    creation failed". start-plan stays declined (Aliyun captcha, #123).
+    **The answer
     is wired at frame ARRIVAL**
     (`ZcodeBackend.providerRuntimeHeadersResponder`, set in ensureBackend), not
     just the turn-loop queue: a headers ask that lands while no turn loop is

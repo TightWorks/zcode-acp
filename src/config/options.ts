@@ -27,8 +27,8 @@ import {
 } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
-import { configProviderIdFor } from "./account-provider.js";
-import { readCredentialConfig } from "./bridge-accounts.js";
+import { configProviderIdFor, entitledLegacyCodingPlanIds } from "./account-provider.js";
+import { codingPlanCatalog, readCredentialConfig } from "./bridge-accounts.js";
 import { initialSessionMode } from "./settings.js";
 
 interface ProviderModelsJson {
@@ -225,6 +225,52 @@ function isLocalBaseURL(url: string | undefined): boolean {
  * rule itself (`config.access.apiKey` / `config.api.baseUrl`), selectability
  * follows the same rule as config.json entries (#156).
  */
+/** Models Desktop turned off in provider_config.json (`config.enabled: false`). */
+function disabledPersonalModelKeys(): Set<string> {
+  const pc = readPersonalProviderConfig();
+  const rules = [
+    ...(pc?.config?.modelConfigRules?.providerModelRules ?? []),
+    ...(pc?.config?.modelConfigRules?.manualProviderModelRules ?? []),
+  ];
+  const out = new Set<string>();
+  for (const rule of rules) {
+    if (!rule.providerId || !rule.modelId || rule.config?.enabled !== false) continue;
+    out.add(`${configProviderIdFor(rule.providerId)}\\${rule.modelId}`);
+  }
+  return out;
+}
+
+/**
+ * Account coding-plan models from the installed builtin table.
+ *
+ * A Desktop OAuth / Coding Max login writes no config.json, so the legacy
+ * provider map is empty and the dropdown used to fall back to a single
+ * GLM-5.3. The table's individual-plan `builtinModelIds` is the catalog
+ * Desktop shows (GLM-5.3 and GLM-5.3-Flash for Coding Plan / Coding Max).
+ * A personal rule with `enabled: false` is a toggle off and stays hidden.
+ * Start-plan ids are never added here.
+ */
+function appendEntitledCodingPlanModels(out: ModelRef[], pinned: string | undefined): void {
+  const disabled = disabledPersonalModelKeys();
+  for (const legacyId of entitledLegacyCodingPlanIds()) {
+    if (pinned && pinned !== legacyId) continue;
+    const family = legacyId === "builtin:zai-coding-plan" ? "zai" : "bigmodel";
+    let catalog: ReturnType<typeof codingPlanCatalog>;
+    try {
+      catalog = codingPlanCatalog(family);
+    } catch {
+      continue;
+    }
+    const present = new Set(
+      out.filter((model) => model.providerId === legacyId).map((model) => model.modelId),
+    );
+    for (const modelId of catalog.models) {
+      if (disabled.has(`${legacyId}\\${modelId}`) || present.has(modelId)) continue;
+      out.push({ providerId: legacyId, providerName: catalog.name, modelId });
+    }
+  }
+}
+
 function appendPersonalOnlyProviders(
   out: ModelRef[],
   personal: PersonalModels,
@@ -286,6 +332,7 @@ export function loadAllModels(): ModelRef[] {
       }
     }
     if (personal) appendPersonalOnlyProviders(out, personal, pinned);
+    appendEntitledCodingPlanModels(out, pinned);
     // The default-provider fallback applies only to a MISSING/empty provider
     // map (fresh install). When providers ARE configured but none is usable
     // (all keyless/未启用, #156), returning [] is correct: the fallback would
@@ -306,6 +353,7 @@ export function loadAllModels(): ModelRef[] {
     // its providers before the fresh-install default kicks in.
     const out: ModelRef[] = [];
     if (personal) appendPersonalOnlyProviders(out, personal, process.env.ZCODE_PROVIDER);
+    appendEntitledCodingPlanModels(out, process.env.ZCODE_PROVIDER);
     if (out.length > 0) return out;
     return [
       {
