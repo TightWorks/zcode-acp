@@ -47,7 +47,12 @@ import {
   splitAskUserQuestions,
   zcodePermissionToAcp,
 } from "../interaction/adapter.js";
-import { codingPlanRequestAuthFor } from "../config/account-provider.js";
+import {
+  codingPlanRequestAuthFor,
+  oauthOwnsIndividualCodingPlan,
+} from "../config/account-provider.js";
+import { OFFICIAL_MCP_AUTH_METHOD, officialMcpAuthReply } from "../config/official-mcp-auth.js";
+import { resolveOauthCodingPlanRequestAuth } from "../config/oauth-coding-plan.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
 import { interactionTimeoutMs } from "../config/settings.js";
 import { messages } from "../i18n.js";
@@ -325,9 +330,11 @@ export async function handleServerRequests(
           sendZcodeReply(
             backend,
             req.id,
-            isProviderRuntimeHeadersRequest(req.method)
-              ? { headersApplied: false, errorMessage: "turn cancelled" }
-              : { action: "decline", reason: "turn cancelled" },
+            isOfficialMcpAuthHeadersRequest(req.method)
+              ? { ok: false, reason: "official_auth_unavailable" }
+              : isProviderRuntimeHeadersRequest(req.method)
+                ? { headersApplied: false, errorMessage: "turn cancelled" }
+                : { action: "decline", reason: "turn cancelled" },
           );
           declined = true;
         } else {
@@ -387,6 +394,10 @@ async function handleOne(
 
   if (isProviderRuntimeHeadersRequest(method)) {
     answerProviderRuntimeHeaders(backend, zcodeReqId, method, params as Record<string, unknown>);
+    return;
+  }
+  if (isOfficialMcpAuthHeadersRequest(method)) {
+    answerOfficialMcpAuthHeaders(backend, zcodeReqId, method, params as Record<string, unknown>);
     return;
   }
 
@@ -532,6 +543,10 @@ async function settleOrphan(
     }
     if (isProviderRuntimeHeadersRequest(req.method)) {
       answerProviderRuntimeHeaders(backend, req.id, req.method, params);
+      return;
+    }
+    if (isOfficialMcpAuthHeadersRequest(req.method)) {
+      answerOfficialMcpAuthHeaders(backend, req.id, req.method, params);
       return;
     }
     if (isPermissionRequest(req.method) && isSessionAlwaysTool(`${params["toolName"] ?? ""}`)) {
@@ -1322,6 +1337,41 @@ function isProviderRuntimeHeadersRequest(method: string): boolean {
   return method === "interaction/requestProviderRuntimeHeaders";
 }
 
+function isOfficialMcpAuthHeadersRequest(method: string): boolean {
+  return method === OFFICIAL_MCP_AUTH_METHOD;
+}
+
+/**
+ * Answer `interaction/requestOfficialMcpAuthHeaders`. Desktop 3.17 asks this
+ * during model setup; leaving it unhandled or declining it as a permission
+ * (`{action:"decline"}`) fails the turn with CONFIGURATION_ERROR "Model
+ * creation failed". The body is the official-MCP header object, built from
+ * the same oauth credential store the project-token path reads.
+ */
+export function answerOfficialMcpAuthHeaders(
+  backend: ZcodeBackend,
+  reqId: number | string,
+  method: string,
+  params: Record<string, unknown>,
+): boolean {
+  if (!isOfficialMcpAuthHeadersRequest(method)) return false;
+  let reply: ReturnType<typeof officialMcpAuthReply>;
+  try {
+    reply = officialMcpAuthReply(params);
+  } catch (error) {
+    warn(
+      `official mcp auth headers failed closed (${
+        error instanceof Error ? error.message : "official_auth_unavailable"
+      })`,
+    );
+    reply = { ok: false, reason: "official_auth_unavailable" };
+  }
+  if (reply.ok) log("  official mcp auth headers: serving oauth identity headers");
+  else warn(`  ⚠ official mcp auth headers declined (${reply.reason})`);
+  sendZcodeReply(backend, reqId, reply);
+  return true;
+}
+
 /**
  * Answer an `interaction/requestProviderRuntimeHeaders` request; returns false
  * when `method` is not that request (caller keeps its own handling).
@@ -1349,12 +1399,54 @@ export function answerProviderRuntimeHeaders(
   // (observed 2026-09-17: switch stuck, every send died with "unknown").
   const sel = (params as { modelSelection?: { providerId?: string }; providerId?: string })
     .modelSelection?.providerId;
-  const requestAuth = codingPlanRequestAuthFor(
-    sel ?? (params as { providerId?: string }).providerId,
-  );
+  const providerId = sel ?? (params as { providerId?: string }).providerId;
+  const requestAuth = codingPlanRequestAuthFor(providerId);
+  // config.json, bridge accounts, and manual provider_config keys still win.
+  // An oauth-owned plan with none of those returns null here on purpose: the
+  // sync reader must not hand the login JWT or a leftover :api-key to the
+  // model. The project-token exchange below is what Desktop's host answers.
   if (requestAuth) {
     log("  provider runtime headers: serving the coding-plan API key (config.json or store)");
     sendZcodeReply(backend, reqId, { headersApplied: true, requestAuth });
+    return true;
+  }
+  if (oauthOwnsIndividualCodingPlan(providerId)) {
+    const expected = (params as { expectedAccountScope?: unknown }).expectedAccountScope;
+    const rejected = (params as { rejectedProjectTokenFingerprint?: unknown })
+      .rejectedProjectTokenFingerprint;
+    void resolveOauthCodingPlanRequestAuth(providerId, {
+      ...(typeof expected === "string" ? { expectedAccountScope: expected } : {}),
+      ...(typeof rejected === "string" ? { rejectedProjectTokenFingerprint: rejected } : {}),
+    })
+      .then((oauthAuth) => {
+        if (oauthAuth) {
+          log("  provider runtime headers: serving oauth project access token");
+          sendZcodeReply(backend, reqId, { headersApplied: true, requestAuth: oauthAuth });
+          return;
+        }
+        warn("  ⚠ provider runtime headers: oauth coding-plan credential unavailable");
+        sendZcodeReply(backend, reqId, {
+          headersApplied: false,
+          errorMessage: OAUTH_CODING_PLAN_UNAVAILABLE,
+        });
+      })
+      .catch((error: unknown) => {
+        warn(
+          `  ⚠ provider runtime headers: oauth token exchange failed (${
+            error instanceof Error && error.message.startsWith("project_token_")
+              ? error.message
+              : "project_token_request_failed"
+          })`,
+        );
+        try {
+          sendZcodeReply(backend, reqId, {
+            headersApplied: false,
+            errorMessage: OAUTH_CODING_PLAN_UNAVAILABLE,
+          });
+        } catch {
+          /* backend gone */
+        }
+      });
     return true;
   }
   // Start Plan providers (zcode-plan endpoints) ask their host to solve an
@@ -1385,3 +1477,13 @@ const PROVIDER_RUNTIME_HEADERS_UNAVAILABLE =
   "Start Plan providers require an Aliyun captcha session that only the " +
   "ZCode desktop app can provide. Use a GLM Coding Plan provider for " +
   "headless/editor sessions (see docs/TROUBLESHOOTING.md).";
+
+/**
+ * Surfaced through the backend's -32031 when an individual coding plan's
+ * Desktop OAuth login cannot be exchanged for a project access token.
+ * Missing and expired logins fail closed — the bridge does not invent an
+ * API key from the OAuth JWT.
+ */
+const OAUTH_CODING_PLAN_UNAVAILABLE =
+  "GLM Coding Plan OAuth login is missing or expired, or the project access " +
+  "token could not be issued. Sign in again in the ZCode desktop app.";

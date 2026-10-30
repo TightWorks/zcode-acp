@@ -133,7 +133,21 @@ function buildProviderElement(providerId: string, p: ProviderEntry): Record<stri
  * `provider_not_configured` before auth is even tried.
  */
 export function buildProviderRegistry(): ProviderRegistryPayload {
-  const cfg = readCredentialConfig(ZCODE_CREDS_PATH) as ConfigShape;
+  let cfg: ConfigShape;
+  try {
+    cfg = readCredentialConfig(ZCODE_CREDS_PATH) as ConfigShape;
+  } catch (error) {
+    // Desktop OAuth logins have neither config.json nor acp-accounts.json.
+    // Coding-plan models arrive via the account snapshot, not this third-party
+    // registry. A missing file is an empty payload — throwing made every
+    // session log "provider-registry: sync threw (Cannot read Desktop
+    // credential configuration)".
+    const missing =
+      (error as NodeJS.ErrnoException).code === "ENOENT" ||
+      (error instanceof Error && error.message === "Cannot read Desktop credential configuration");
+    if (!missing) throw error;
+    return { providers: [], generatedAt: Date.now(), revision: hashRevision([]) };
+  }
   const allEntries = Object.entries(cfg.provider ?? {});
   const skipped: string[] = [];
   const providers = [] as ReturnType<typeof buildProviderElement>[];
